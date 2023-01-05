@@ -1,0 +1,44 @@
+#!/bin/bash
+
+set -e
+
+help_fn() {
+  echo "Usage: hrun -N <num_nodes> --container <pyxis_container_name> <command-to-run-with-smddprun>"
+}
+
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
+  -N | --nodes)
+    num_nodes=$2
+    shift 2
+    ;;
+  --container)
+    container_name=$2
+    shift 2
+    ;;
+  --nodelist)
+    nodelist=$2
+    shift 2
+    ;;
+  --master)
+    master=$2
+    shift 2
+    ;;
+  -h | --help)
+    help_fn
+    exit
+    ;;
+  *)
+    break
+    ;;
+  esac
+done
+
+script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+if [ ! -z "$nodelist" ]; then
+    nodelist_command="--nodelist=$nodelist"
+fi
+
+salloc -N $num_nodes $nodelist_command --exclusive bash exec_inside_alloc.sh --master $master -N $num_nodes --container $container_name --script_dir $script_dir $@
