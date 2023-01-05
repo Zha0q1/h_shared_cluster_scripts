@@ -1,0 +1,274 @@
+#!/bin/bash
+set -e
+
+export PATH="/fsx/smddp_util_files/pcscripts:$PATH"
+
+allotment_dir=~/smddpjobs/allotment
+
+mark_in_use() {
+  exclude_list=$(cat ~/smddpjobs/allotment/* | xargs | sed 's/ /,/g')
+  if [ ! -z "$exclude_list" ]; then
+    exclude_command="--exclude $exclude_list"
+  fi
+  set +e
+  slurm_node_utils.py --task ensure_no_overlap --include $1 $exclude_command
+  if [ $? -eq 1 ]; then
+    echo "Can not allot these nodes as they overlap with existing allotments. Make sure to free previous allotment for same user, and ensure the nodes requested aren't already in other users' allotments"
+    exit 1
+  fi
+  set -e
+  mkdir -p $allotment_dir
+  path=$allotment_dir/$user
+  rm -f $path
+  echo "$1" >> $path
+}
+
+remove_allotment() {
+  rm -f $allotment_dir/$user
+}
+
+list_allotment() {
+  if test -f $allotment_dir/$user; then
+    echo $(cat $allotment_dir/$user)
+  else
+    echo "No allotment for this user"
+  fi
+}
+
+list_free_nodes() {
+  all_nodes=$(sinfo | grep -e 'idle\|mix' | grep -v -e 'idle%' | grep -v -e 'idle~' | tr -s ' ' | cut -d' ' -f 6 | grep compute- | xargs | sed 's/ /,/g')
+  exclude_list=$(cat ~/smddpjobs/allotment/* | xargs | sed 's/ /,/g')
+  if [ ! -z "$exclude_list" ]; then
+    exclude_command="--exclude $exclude_list"
+  fi
+  free_nodes=$(slurm_node_utils.py --task filter --include $all_nodes $exclude_command)
+  echo $free_nodes
+}
+
+run_on_allotment() {
+  command=$@
+  srun --nodelist $(cat ~/smddpjobs/allotment/$user) $command
+}
+
+herring_run() {
+  if ! test -f $allotment_dir/$user; then
+    echo "No allotment for this user"
+    exit 1
+  fi
+  while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+    -N | --nodes)
+      num_nodes=$2
+      shift 2
+      ;;
+    -C | --container)
+      container_name="${user}_${2}"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+    esac
+  done
+  set +e
+  nodelist=$(slurm_node_utils.py --task select --include $(cat ~/smddpjobs/allotment/$user) --select $num_nodes)
+  if [ $? -eq 1 ]; then
+    echo $nodelist
+    exit 1
+  fi
+  set -e
+  master=$(slurm_node_utils.py --task select --include $(cat ~/smddpjobs/allotment/$user) --select 1)
+  hrun -N $num_nodes --nodelist $nodelist --container $container_name --master $master $@
+}
+
+herring_build() {
+  if ! test -f $allotment_dir/$user; then
+    echo "No allotment for this user"
+    exit 1
+  fi
+  while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+    -src | --src)
+      src_path=$2
+      shift 2
+      ;;
+    -C | --container)
+      container_name=$2
+      container_name="pyxis_${user}_${container_name}"
+      shift 2
+      ;;
+    -script | --script)
+      build_script=$2
+      shift 2
+      ;;
+    esac
+  done
+
+  set +e
+  master=$(slurm_node_utils.py --task select --include $(cat ~/smddpjobs/allotment/$user) --select 1)
+  if [ $? -eq 1 ]; then
+    exit 1
+  fi
+  set -e
+  
+  srun -N 1 --cpus-per-task 32 --pty \
+    enroot start --rw --root -m ${src_path}:/herring_build ${container_name} \
+    bash -c "cd . && cd /herring_build && bash ${build_script}"
+}
+
+import_enroot() {
+  image_uri=$1
+  container_name=$2
+  temp_file=$(mktemp)
+  rm $temp_file
+
+  if [ -z "$container_name" ]; then
+    echo "Container name is empty"
+    exit 1
+  fi
+
+  container_name="pyxis_${user}_${container_name}"
+  num_matches=$(enroot list | grep -w "${container_name}$" | wc -l)
+
+  if [ "$num_matches" -gt 0 ]; then
+    echo "Enroot container with name ${container_name} already exist"
+    exit 1
+  fi
+  
+  sudo systemctl start docker
+  docker pull $image_uri
+  EXIT_STATUS=$?
+  if [ $EXIT_STATUS -ne 0 ]; then
+      echo "Pulling image $image_uri failed. Check image uri or log into the image repository first"
+      exit 1
+  fi
+
+  echo "Importing $container_name"
+  enroot import --output ${temp_file} dockerd://${image_uri}
+
+  echo "Creating container ${container_name}"
+  enroot create --name "${container_name}" ${temp_file}
+
+  rm ${temp_file}
+  echo "Created Enroot container ${container_name}"
+}
+
+list_enroot() {
+  echo $(enroot list | grep $user)
+}
+
+login_container() {
+  container_name=$1
+  container_name="pyxis_${user}_${container_name}"
+  num_matches=$(enroot list | grep -w "${container_name}$" | wc -l)
+
+  if [ "$num_matches" -eq 0 ]; then
+    echo "Enroot container with name ${container_name} does not exist"
+    exit 1
+  fi
+
+  if ! test -f $allotment_dir/$user; then
+    echo "No allotment for this user"
+    exit 1
+  fi
+
+  nodelist=$(slurm_node_utils.py --task select --include $(cat ~/smddpjobs/allotment/$user) --select 1)
+  srun -N 1 --nodelist $nodelist --exclusive --pty enroot start --rw --root -m /fsx:/fsx $container_name
+}
+
+parse_inputs() {
+  user=$1
+  if [[ $user = -* ]]; then
+    echo "User can not start with -, please check if user is being passed in"
+    exit 1
+  fi
+  tmpdir=~/jobs/$user
+  mkdir -p $tmpdir
+  cur_count=`ls -ldh $tmpdir/* 2> /dev/null | wc -l`
+  shift 1
+  while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+    -allot | --allot)
+      mark_in_use $2
+      exit
+      ;;
+    -free | --free-allotment)
+      remove_allotment
+      exit
+      ;;
+    -list | --list-allotment)
+      list_allotment
+      exit
+      ;;
+    -list-free | --list-free-nodes)
+      list_free_nodes
+      exit
+      ;;
+    -rall | --run-on-allotment)
+      shift 1
+      run_on_allotment $@
+      exit
+      ;;
+    -hrun | --hrun |--herring-run)
+      shift 1
+      herring_run $@
+      exit
+      ;;
+    -hbuild | --hbuild | --herring-build)
+      shift 1
+      herring_build $@
+      exit
+      ;;
+    -import-enroot | --import-enroot)
+      shift 1
+      import_enroot $@
+      exit
+      ;;
+    -list-enroot | --list-enroot)
+      shift 1
+      list_enroot
+      exit
+      ;;
+    -login | --login-container)
+      shift 1
+      login_container $@
+      exit
+      ;;
+    --help)
+      echo "This program provides some utils to help manage user allotments on top of slurm cluster"
+      echo "Arguments:"
+      echo "USER (required, has to be first arg)"
+      echo "--allot NODELIST: allots the provided nodelist to USER. This provided nodelist can not overlap with any existing allotments"
+      echo "--list-free-nodes: lists all unallotted nodes in the cluster"
+      echo "--list-allotment: lists the current allotment for USER"
+      echo "--free-allotment: clears the allotment for USER"
+      echo "-rall COMMAND (or --run-on-allotment COMMAND): runs given command on allotment with srun"
+      echo "--hrun -N NUM_NODES -C CONTAINER_NAME: launches a Herring job with NUM_NODES from USER's allotment in container labelled CONTAINER_NAME"
+      echo "--hbuild -src SRC -script SCRIPT -C CONTAINER_NAME: builds Herring with a node from USER's allotment in container labelled CONTAINER_NAME in folder SRC with script SCRIPT"
+      echo "--import-enroot IMAGE_URI CONTAINER_NAME: import IMAGE_URI and creates an Enroot container with name CONTAINER_NAME for USER"
+      echo "--list-enroot: list all Enroot containers USER has"
+      echo "--login CONTAINER_NAME: logs into the Enroot container labelled CONTAINER_NAME with a node from USER's allotment"
+      exit
+      ;;
+    -v | --verbose)
+     shift 1
+     set -x
+     ;;
+    -*)
+      echo "Error, invalid arg $1"
+      exit
+      ;;
+    *)
+      break
+      ;;
+    esac
+  done
+  command=$@
+}
+
+parse_inputs $@
+
+exit 0
